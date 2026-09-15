@@ -1,0 +1,910 @@
+import AppKit
+import Foundation
+
+@MainActor
+final class NarrationWorkspaceModel: ObservableObject {
+    @Published private(set) var projects: [NarrationProject] = []
+    @Published private(set) var selectedProject: NarrationProject?
+    @Published var draftName = ""
+    @Published var draftText = ""
+    @Published var draftVoiceID = ""
+    @Published private(set) var status = "新建一份声音作品，放入原稿后开始制作"
+    @Published private(set) var isGenerating = false
+    @Published private(set) var isFinishing = false
+    @Published private(set) var isPreparingPreview = false
+    @Published private(set) var isImportingSource = false
+    @Published private(set) var isDeliveringExport = false
+    @Published private(set) var queueProgress: GenerationQueueProgress?
+    @Published private(set) var finalAudioURLs: [AudioExportFormat: URL] = [:]
+
+    private let store: ProjectStore
+    private let availableAudioBuilder: AvailableAudioBuilder
+    private let importCoordinator: ContentImportCoordinator
+    private let director = NarrationDirector()
+    private let spokenScriptDirector: any SpokenScriptDirecting
+    let playback: PlaybackController
+    private var activeQueue: GenerationQueue?
+    private var activeImportTask: Task<Void, Never>?
+
+    init(
+        store: ProjectStore = ProjectStore(),
+        spokenScriptDirector: any SpokenScriptDirecting = RuleSpokenScriptDirector(),
+        playback: PlaybackController
+    ) {
+        self.store = store
+        self.availableAudioBuilder = AvailableAudioBuilder(store: store)
+        self.importCoordinator = ContentImportCoordinator(store: store)
+        self.spokenScriptDirector = spokenScriptDirector
+        self.playback = playback
+        playback.onProgressChanged = { [weak self] snapshot in
+            self?.persistPlaybackProgress(snapshot)
+        }
+        reloadProjects()
+        if let mostRecentProject = projects.first {
+            selectProject(mostRecentProject)
+        }
+    }
+
+    var characterCountLabel: String {
+        "\(draftText.count) / \(NarrationProject.maximumCharacterCount)"
+    }
+
+    var canAnalyze: Bool {
+        let count = draftText.trimmingCharacters(in: .whitespacesAndNewlines).count
+        return !isGenerating
+            && !isFinishing
+            && !isImportingSource
+            && count > 0
+            && draftText.count <= NarrationProject.maximumCharacterCount
+            && !draftVoiceID.isEmpty
+    }
+
+    var canStartGeneration: Bool {
+        let count = draftText.trimmingCharacters(in: .whitespacesAndNewlines).count
+        return !isGenerating
+            && !isFinishing
+            && !isImportingSource
+            && count > 0
+            && draftText.count <= NarrationProject.maximumCharacterCount
+            && !draftVoiceID.isEmpty
+    }
+
+    var canGenerate: Bool {
+        guard let selectedProject else { return false }
+        return !isGenerating
+            && !isFinishing
+            && !isImportingSource
+            && !selectedProject.segments.isEmpty
+    }
+
+    var completedSegmentCount: Int {
+        selectedProject?.segments.filter { $0.generationState == .completed }.count ?? 0
+    }
+
+    var allSegmentsCompleted: Bool {
+        guard let selectedProject, !selectedProject.segments.isEmpty else { return false }
+        return selectedProject.segments.allSatisfy { $0.generationState == .completed }
+    }
+
+    var availableSegmentCount: Int {
+        guard let selectedProject else { return 0 }
+        return availableAudioBuilder.availableSegmentCount(in: selectedProject)
+    }
+
+    var commonSpeedFactor: Double {
+        guard let segments = selectedProject?.segments, let first = segments.first else { return 1.0 }
+        return segments.dropFirst().allSatisfy { abs($0.speedFactor - first.speedFactor) < 0.001 }
+            ? first.speedFactor
+            : 1.0
+    }
+
+    var estimatedFinalDuration: TimeInterval {
+        guard let project = selectedProject else { return 0 }
+        return project.segments.reduce(0) { total, segment in
+            let sourceDuration = segment.candidates
+                .first(where: { $0.id == segment.selectedCandidateID })?
+                .durationSeconds ?? 0
+            return total + sourceDuration / max(segment.speedFactor, 0.1) + pauseSeconds(segment.pause)
+        }
+    }
+
+    func setDefaultVoiceIfNeeded(_ voiceID: String) {
+        if draftVoiceID.isEmpty { draftVoiceID = voiceID }
+    }
+
+    func updateDraftText(_ text: String) {
+        draftText = text
+        refreshDraftAudioAvailability()
+    }
+
+    func updateDraftVoiceID(_ voiceID: String) {
+        draftVoiceID = voiceID
+        refreshDraftAudioAvailability()
+    }
+
+    func importPlainText(_ text: String) {
+        beginImport(.plainText(text: text, title: nil))
+    }
+
+    func importPDF(_ url: URL) {
+        beginImport(.pdf(url))
+    }
+
+    func importWebPage(_ url: URL) {
+        beginImport(.webPage(url))
+    }
+
+    func saveProjectName() {
+        guard var project = selectedProject else { return }
+        project.name = resolvedName()
+        project.updatedAt = Date()
+        do {
+            try store.save(project)
+            selectedProject = project
+            draftName = project.name
+            reloadProjects(selecting: project.id)
+            status = "作品名称已保存"
+        } catch {
+            status = "作品名称保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    func startNewProject(defaultVoiceID: String) {
+        playback.stopAndUnload()
+        selectedProject = nil
+        draftName = ""
+        draftText = ""
+        draftVoiceID = defaultVoiceID
+        finalAudioURLs = [:]
+        queueProgress = nil
+        status = "粘贴一篇知识文章，应用会安排自然的段落与停顿"
+    }
+
+    func selectProject(_ project: NarrationProject) {
+        do {
+            playback.stopAndUnload()
+            let loaded = try store.loadProject(id: project.id)
+            selectedProject = loaded
+            draftName = loaded.name
+            draftText = loaded.sourceText
+            draftVoiceID = loaded.voiceID
+            loadFinalURLs(from: loaded)
+            switch loaded.importState {
+            case .captured, .extracting:
+                status = "来源已经保存，正在提取可以朗读的文字"
+            case .needsAttention:
+                status = loaded.importErrorSummary ?? "这份内容需要重新处理"
+            case .ready:
+                status = loaded.segments.isEmpty
+                    ? "内容已保存，选择音色后即可生成"
+                    : "已恢复 \(loaded.segments.count) 个朗读段落"
+            }
+        } catch {
+            status = "项目打开失败：\(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    func analyzeAndSave(mode requestedMode: NarrationScriptMode? = nil) -> Bool {
+        guard canAnalyze else { return false }
+        do {
+            let mode = requestedMode ?? selectedProject?.scriptMode ?? .spoken
+            let script = try spokenScriptDirector.prepare(sourceText: draftText, mode: mode)
+            let analyzed = director.analyze(script: script, voiceID: draftVoiceID)
+            var project: NarrationProject
+            if var existing = selectedProject {
+                existing.name = resolvedName()
+                existing.sourceText = draftText
+                existing.voiceID = draftVoiceID
+                existing.scriptMode = mode
+                existing.scriptVersion = script.version
+                existing.outline = script.outline
+                existing.scriptState = script.usedFallback ? .fallback : .completed
+                existing.scriptErrorSummary = script.warning
+                existing.updatedAt = Date()
+                existing.segments = merge(analyzed: analyzed, with: existing.segments, voiceID: draftVoiceID)
+                existing.refreshSegmentFingerprints(invalidateChanged: true)
+                existing.exports = []
+                project = existing
+            } else {
+                project = try store.createProject(
+                    name: resolvedName(),
+                    sourceText: draftText,
+                    voiceID: draftVoiceID
+                )
+                project.scriptMode = mode
+                project.scriptVersion = script.version
+                project.outline = script.outline
+                project.scriptState = script.usedFallback ? .fallback : .completed
+                project.scriptErrorSummary = script.warning
+                project.segments = analyzed
+                project.updatedAt = Date()
+            }
+            try store.save(project)
+            selectedProject = project
+            draftName = project.name
+            finalAudioURLs = [:]
+            reloadProjects(selecting: project.id)
+            if script.usedFallback {
+                status = script.warning ?? "自然整理未通过检查，已安全改为逐字朗读"
+            } else {
+                status = "已整理为 \(project.segments.count) 个连续语义段，可直接生成全文"
+            }
+            return true
+        } catch {
+            status = "分析失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func updateScriptMode(_ mode: NarrationScriptMode) {
+        guard !isGenerating, !isFinishing else { return }
+        guard selectedProject?.scriptMode != mode else { return }
+        if analyzeAndSave(mode: mode) {
+            if selectedProject?.scriptState == .fallback {
+                status = selectedProject?.scriptErrorSummary
+                    ?? "自然整理未通过检查，已安全改为逐字朗读"
+            } else {
+                status = mode == .spoken
+                    ? "已切换为自然讲解；原文仍完整保留"
+                    : "已切换为逐字朗读"
+            }
+        }
+    }
+
+    func reprepareScript() {
+        guard let mode = selectedProject?.scriptMode else { return }
+        if analyzeAndSave(mode: mode) {
+            status = mode == .spoken ? "口语稿已重新整理" : "逐字朗读段落已重新整理"
+        }
+    }
+
+    func startGeneration(using voice: VoiceProfile) {
+        guard canStartGeneration else { return }
+        let draftChanged = selectedProject == nil
+            || selectedProject?.sourceText != draftText
+            || selectedProject?.voiceID != draftVoiceID
+            || selectedProject?.segments.isEmpty == true
+            || selectedProject?.needsSpokenScriptRefresh(
+                currentVersion: spokenScriptDirector.version
+            ) == true
+        if draftChanged, !analyzeAndSave() { return }
+
+        if allSegmentsCompleted {
+            if finalAudioURLs.isEmpty {
+                makeFinalAudio()
+            } else {
+                status = "音频已经准备好，可以直接播放或在访达中查看"
+            }
+            return
+        }
+        runGeneration(using: voice, onlySegmentID: nil, automaticallyFinish: true)
+    }
+
+    func updateSegment(
+        id: String,
+        expression: NarrationExpression? = nil,
+        expressionIntensity: ExpressionIntensity? = nil,
+        speedFactor: Double? = nil,
+        pause: NarrationPause? = nil
+    ) {
+        guard var project = selectedProject,
+              let index = project.segments.firstIndex(where: { $0.id == id }) else { return }
+        if let expression { project.segments[index].expression = expression.currentValue }
+        if let expressionIntensity {
+            project.segments[index].expressionIntensity = expressionIntensity
+        }
+        if let speedFactor {
+            project.segments[index].speedFactor = NarrationSegment.normalizedSpeedFactor(speedFactor)
+        }
+        if let pause { project.segments[index].pause = pause }
+        project.segments[index].refreshFingerprint(
+            voiceID: project.voiceID,
+            invalidateChanged: true
+        )
+        project.updatedAt = Date()
+        project.exports = []
+        do {
+            try store.save(project)
+            selectedProject = project
+            finalAudioURLs = [:]
+            if playback.contextID == project.id { playback.stopAndUnload() }
+            reloadProjects(selecting: project.id)
+            if expression == nil && expressionIntensity == nil {
+                status = "第 \(project.segments[index].order + 1) 段成品设置已更新；母版保留，无需重新生成"
+            } else {
+                status = "第 \(project.segments[index].order + 1) 段表达已更新，需要重新生成"
+            }
+        } catch {
+            status = "段落保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    func updateSegmentText(id: String, text: String) {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else {
+            status = "朗读文字不能为空"
+            return
+        }
+        guard clean.count <= SpokenScriptValidator.hardMaximumCharacters else {
+            status = "单个连续语义段最多 180 个字；请拆分后再修改"
+            return
+        }
+        guard var project = selectedProject,
+              let index = project.segments.firstIndex(where: { $0.id == id }) else { return }
+        guard project.segments[index].text != clean else { return }
+        project.segments[index].spokenText = clean
+        project.segments[index].refreshScriptFingerprint(scriptVersion: project.scriptVersion)
+        project.segments[index].refreshFingerprint(
+            voiceID: project.voiceID,
+            invalidateChanged: true
+        )
+        project.exports = []
+        project.updatedAt = Date()
+        do {
+            try store.save(project)
+            selectedProject = project
+            finalAudioURLs = [:]
+            if playback.contextID == project.id { playback.stopAndUnload() }
+            reloadProjects(selecting: project.id)
+            status = "第 \(project.segments[index].order + 1) 个连续语义段已更新，只需重做这一段"
+        } catch {
+            status = "朗读文字保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    func restoreSegmentSource(id: String) {
+        guard var project = selectedProject,
+              let index = project.segments.firstIndex(where: { $0.id == id }) else { return }
+        let source = project.segments[index].sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty, project.segments[index].spokenText != source else { return }
+        project.segments[index].spokenText = source
+        project.segments[index].refreshScriptFingerprint(scriptVersion: project.scriptVersion)
+        project.segments[index].refreshFingerprint(
+            voiceID: project.voiceID,
+            invalidateChanged: true
+        )
+        project.exports = []
+        project.updatedAt = Date()
+        do {
+            try store.save(project)
+            selectedProject = project
+            finalAudioURLs = [:]
+            if playback.contextID == project.id { playback.stopAndUnload() }
+            reloadProjects(selecting: project.id)
+            status = "第 \(project.segments[index].order + 1) 个连续语义段已恢复原文，只需重做这一段"
+        } catch {
+            status = "恢复原文失败：\(error.localizedDescription)"
+        }
+    }
+
+    func selectCandidate(segmentID: String, candidateID: String) {
+        guard !isGenerating, !isFinishing,
+              var project = selectedProject,
+              let index = project.segments.firstIndex(where: { $0.id == segmentID }),
+              let candidate = project.segments[index].candidates.first(where: {
+                  $0.id == candidateID && $0.inputFingerprint == project.segments[index].inputFingerprint
+              }),
+              let candidateURL = try? store.resolveProjectFileURL(
+                  projectID: project.id,
+                  relativePath: candidate.relativePath
+              ),
+              FileManager.default.fileExists(atPath: candidateURL.path) else { return }
+        project.segments[index].selectedCandidateID = candidateID
+        project.segments[index].generationState = .completed
+        project.exports = []
+        project.updatedAt = Date()
+        do {
+            try store.save(project)
+            selectedProject = project
+            finalAudioURLs = [:]
+            if playback.contextID == project.id { playback.stopAndUnload() }
+            reloadProjects(selecting: project.id)
+            status = "已切换第 \(project.segments[index].order + 1) 段版本，正在更新成品"
+            if allSegmentsCompleted { makeFinalAudio() }
+        } catch {
+            status = "候选版本保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    func regenerateSegment(id: String, using voice: VoiceProfile) {
+        guard !isGenerating, !isFinishing,
+              var project = selectedProject,
+              let index = project.segments.firstIndex(where: { $0.id == id }) else { return }
+        project.segments[index].generationState = .pending
+        project.segments[index].selectedCandidateID = nil
+        project.segments[index].errorSummary = nil
+        project.exports = []
+        project.updatedAt = Date()
+        do {
+            try store.save(project)
+            selectedProject = project
+            finalAudioURLs = [:]
+            if playback.contextID == project.id { playback.stopAndUnload() }
+            reloadProjects(selecting: project.id)
+            runGeneration(using: voice, onlySegmentID: id, automaticallyFinish: true)
+        } catch {
+            status = "无法重新生成这一段：\(error.localizedDescription)"
+        }
+    }
+
+    func applySpeedToAll(_ requestedSpeed: Double) {
+        guard var project = selectedProject else { return }
+        let speed = NarrationSegment.normalizedSpeedFactor(requestedSpeed)
+        for index in project.segments.indices {
+            project.segments[index].speedFactor = speed
+        }
+        project.exports = []
+        project.updatedAt = Date()
+        do {
+            try store.save(project)
+            selectedProject = project
+            finalAudioURLs = [:]
+            if playback.contextID == project.id { playback.stopAndUnload() }
+            reloadProjects(selecting: project.id)
+            status = String(format: "全文成品语速已设为 %.1f×；段落母版保留", speed)
+        } catch {
+            status = "全文语速保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    func generateAll(using voice: VoiceProfile) {
+        runGeneration(using: voice, onlySegmentID: nil, automaticallyFinish: false)
+    }
+
+    private func runGeneration(
+        using voice: VoiceProfile,
+        onlySegmentID: String?,
+        automaticallyFinish: Bool
+    ) {
+        guard canGenerate, let projectID = selectedProject?.id else { return }
+        let engineChoice = DeviceSynthesisPolicy.recommendedEngine(
+            naturalResourcesAvailable: RuntimeLocator.qwen.isAvailable
+        )
+        let engine: SpeechEngine = engineChoice == .natural
+            ? QwenSpeechEngine()
+            : ZipVoiceSpeechEngine()
+        let queue = GenerationQueue(store: store, engine: engine)
+        activeQueue = queue
+        isGenerating = true
+        queueProgress = GenerationQueueProgress(
+            completed: onlySegmentID == nil ? completedSegmentCount : 0,
+            total: onlySegmentID == nil ? (selectedProject?.segments.count ?? 0) : 1,
+            currentSegment: onlySegmentID == nil ? max(1, completedSegmentCount + 1) : 1,
+            status: "正在准备\(engine.displayName)"
+        )
+        status = onlySegmentID == nil
+            ? "开始逐段生成；已经完成的段落会自动保留"
+            : "正在重新生成这一段；原来的版本仍会保留"
+        let owner = self
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let summary = try queue.run(
+                    projectID: projectID,
+                    voice: voice,
+                    onlySegmentID: onlySegmentID
+                ) { progress in
+                    Task { @MainActor [weak owner] in
+                        guard owner?.activeQueue === queue else { return }
+                        owner?.queueProgress = progress
+                        owner?.status = progress.status
+                        owner?.reloadSelectedProject()
+                    }
+                }
+                Task { @MainActor [weak owner] in
+                    guard let owner, owner.activeQueue === queue else { return }
+                    owner.activeQueue = nil
+                    owner.isGenerating = false
+                    owner.reloadSelectedProject()
+                    if summary.cancelled {
+                        owner.status = "已暂停，完成的段落都已保存"
+                    } else if summary.failed > 0 {
+                        owner.status = "有一段生成失败；再次点击生成会从这里继续"
+                    } else if automaticallyFinish && owner.allSegmentsCompleted {
+                        owner.status = "语音生成完成，正在自动制作三种成品"
+                        owner.makeFinalAudio()
+                    } else {
+                        owner.status = "语音生成完成"
+                    }
+                }
+            } catch {
+                Task { @MainActor [weak owner] in
+                    guard owner?.activeQueue === queue else { return }
+                    owner?.activeQueue = nil
+                    owner?.isGenerating = false
+                    owner?.reloadSelectedProject()
+                    owner?.status = "生成失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func cancelGeneration() {
+        activeQueue?.cancel()
+        status = "正在安全暂停，已完成的段落会保留…"
+    }
+
+    func makeFinalAudio() {
+        guard !isFinishing, allSegmentsCompleted, let project = selectedProject else { return }
+        isFinishing = true
+        status = "正在统一音量、加入停顿并制作三种成品…"
+        let projectID = project.id
+        let store = self.store
+        let owner = self
+        if playback.contextID == project.id { playback.stopAndUnload() }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let master = try store.resolveProjectFileURL(
+                    projectID: projectID,
+                    relativePath: "final/朗读成品.wav"
+                )
+                _ = try AudioAssembler(store: store).assemble(
+                    project: project,
+                    destination: master
+                )
+                let m4a = master.deletingPathExtension().appendingPathExtension("m4a")
+                let mp3 = master.deletingPathExtension().appendingPathExtension("mp3")
+                let exporter = AudioExporter()
+                try exporter.export(wav: master, to: m4a, format: .m4a)
+                try exporter.export(wav: master, to: mp3, format: .mp3)
+
+                var updated = try store.loadProject(id: projectID)
+                updated.exports = [
+                    NarrationExportRecord(format: "wav", relativePath: "final/朗读成品.wav"),
+                    NarrationExportRecord(format: "m4a", relativePath: "final/朗读成品.m4a"),
+                    NarrationExportRecord(format: "mp3", relativePath: "final/朗读成品.mp3"),
+                ]
+                updated.updatedAt = Date()
+                try store.save(updated)
+                Task { @MainActor [weak owner] in
+                    owner?.isFinishing = false
+                    owner?.selectedProject = updated
+                    owner?.finalAudioURLs = [.wav: master, .m4a: m4a, .mp3: mp3]
+                    owner?.reloadProjects(selecting: projectID)
+                    owner?.status = "三种成品已制作完成，可播放或在访达中查看"
+                }
+            } catch {
+                Task { @MainActor [weak owner] in
+                    owner?.isFinishing = false
+                    owner?.status = "成品制作失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func playSegment(_ segment: NarrationSegment) {
+        guard let project = selectedProject,
+              let selectedID = segment.selectedCandidateID,
+              let candidate = segment.candidates.first(where: { $0.id == selectedID }),
+              let url = try? store.resolveProjectFileURL(
+                projectID: project.id,
+                relativePath: candidate.relativePath
+              ) else { return }
+        do {
+            try playback.play(
+                url: url,
+                title: "第 \(segment.order + 1) 段 · \(segment.kind.label)",
+                contextID: project.id,
+                initialRate: segment.speedFactor
+            )
+            status = String(format: "正在按成品语速 %.1f× 播放第 %d 段", segment.speedFactor, segment.order + 1)
+        } catch {
+            status = "播放失败：\(error.localizedDescription)"
+        }
+    }
+
+    func playFinal(_ format: AudioExportFormat = .m4a) {
+        guard let url = finalAudioURLs[format] ?? finalAudioURLs[.wav] else { return }
+        guard let project = selectedProject else { return }
+        do {
+            try playback.play(
+                url: url,
+                title: "声音作品",
+                contextID: project.id,
+                initialPosition: project.playbackPositionSeconds,
+                tracksProgress: true
+            )
+            status = "正在播放声音作品"
+        } catch {
+            status = "播放失败：\(error.localizedDescription)"
+        }
+    }
+
+    func playBestAvailableAudio() {
+        if !finalAudioURLs.isEmpty {
+            playFinal()
+        } else {
+            playAvailableAudio()
+        }
+    }
+
+    func playAvailableAudio() {
+        guard !isPreparingPreview,
+              finalAudioURLs.isEmpty,
+              let project = selectedProject,
+              availableAudioBuilder.availableSegmentCount(in: project) > 0 else { return }
+        isPreparingPreview = true
+        status = "正在准备已经完成的部分…"
+        let builder = availableAudioBuilder
+        let owner = self
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let preview = try builder.build(project: project)
+                Task { @MainActor [weak owner] in
+                    guard let owner else { return }
+                    owner.isPreparingPreview = false
+                    guard owner.selectedProject?.id == project.id else { return }
+                    do {
+                        try owner.playback.play(
+                            url: preview.outputURL,
+                            title: "已完成 \(preview.segmentCount) 段",
+                            contextID: project.id,
+                            initialPosition: project.playbackPositionSeconds,
+                            tracksProgress: true
+                        )
+                        owner.status = "正在播放已完成的 \(preview.segmentCount) 段，后续仍在本机生成"
+                    } catch {
+                        owner.status = "播放失败：\(error.localizedDescription)"
+                    }
+                }
+            } catch {
+                Task { @MainActor [weak owner] in
+                    owner?.isPreparingPreview = false
+                    owner?.status = "预览准备失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func playFromBeginning() {
+        guard var project = selectedProject else { return }
+        project.playbackPositionSeconds = 0
+        project.listeningCompleted = false
+        project.updatedAt = Date()
+        do {
+            try store.save(project)
+            selectedProject = project
+            updateProjectInList(project)
+            if playback.contextID == project.id { playback.stopAndUnload() }
+            playBestAvailableAudio()
+        } catch {
+            status = "播放位置重置失败：\(error.localizedDescription)"
+        }
+    }
+
+    func revealFinal() {
+        guard let url = finalAudioURLs[.m4a] ?? finalAudioURLs[.wav] else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func deliverFinal(_ format: AudioExportFormat, to destination: URL) {
+        guard !isDeliveringExport,
+              let source = finalAudioURLs[format],
+              FileManager.default.fileExists(atPath: source.path) else {
+            status = "没有找到可导出的 \(format.fileExtension.uppercased()) 成品"
+            return
+        }
+        isDeliveringExport = true
+        status = "正在导出 \(format.fileExtension.uppercased()) 成品…"
+        let owner = self
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try AudioExporter().deliverExisting(source, to: destination, format: format)
+                Task { @MainActor [weak owner] in
+                    owner?.isDeliveringExport = false
+                    owner?.status = "成品已导出到“\(destination.lastPathComponent)”"
+                }
+            } catch {
+                Task { @MainActor [weak owner] in
+                    owner?.isDeliveringExport = false
+                    owner?.status = "成品导出失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func deleteProject(_ project: NarrationProject, defaultVoiceID: String) {
+        do {
+            try store.deleteProject(id: project.id)
+            if selectedProject?.id == project.id {
+                startNewProject(defaultVoiceID: defaultVoiceID)
+            }
+            reloadProjects()
+            status = "项目已移到废纸篓"
+        } catch {
+            status = "项目删除失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func resolvedName() -> String {
+        let clean = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !clean.isEmpty { return clean }
+        let firstLine = draftText.split(whereSeparator: { $0.isNewline }).first.map(String.init)
+            ?? "未命名朗读"
+        return String(firstLine.prefix(24))
+    }
+
+    private func beginImport(_ request: ContentImportRequest) {
+        guard !isImportingSource, !isGenerating, !isFinishing else { return }
+        isImportingSource = true
+        status = "正在把内容保存到本地作品库…"
+        let coordinator = importCoordinator
+        let voiceID = draftVoiceID
+        activeImportTask = Task { [weak self] in
+            do {
+                let project = try await Task.detached(priority: .userInitiated) {
+                    let securityScopedURL: URL?
+                    switch request {
+                    case .plainText:
+                        securityScopedURL = nil
+                    case .pdf(let url):
+                        securityScopedURL = url
+                    case .webPage:
+                        securityScopedURL = nil
+                    }
+                    let didAccess = securityScopedURL?.startAccessingSecurityScopedResource() ?? false
+                    defer {
+                        if didAccess { securityScopedURL?.stopAccessingSecurityScopedResource() }
+                    }
+                    return try await coordinator.importContent(
+                        from: request,
+                        defaultVoiceID: voiceID
+                    )
+                }.value
+                guard let self else { return }
+                self.activeImportTask = nil
+                self.isImportingSource = false
+                self.reloadProjects(selecting: project.id)
+                self.selectProject(project)
+                switch project.source.kind {
+                case .pdf:
+                    self.status = "PDF 已保存在本机，检查文字后即可生成"
+                case .webPage:
+                    self.status = "网页正文已提取并保存在本机，检查后即可生成"
+                default:
+                    self.status = "文字已保存在本机，选择音色后即可生成"
+                }
+            } catch is CancellationError {
+                guard let self else { return }
+                self.activeImportTask = nil
+                self.isImportingSource = false
+                self.reloadProjects()
+                self.status = "导入已停止，来源记录仍保留在本机"
+            } catch {
+                guard let self else { return }
+                self.activeImportTask = nil
+                self.isImportingSource = false
+                self.reloadProjects()
+                if let failed = self.projects.first(where: { $0.importState == .needsAttention }) {
+                    self.selectProject(failed)
+                }
+                self.status = "导入失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func merge(
+        analyzed: [NarrationSegment],
+        with existing: [NarrationSegment],
+        voiceID: String
+    ) -> [NarrationSegment] {
+        let oldByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        return analyzed.map { fresh in
+            guard var previous = oldByID[fresh.id],
+                  previous.sourceText == fresh.sourceText,
+                  previous.spokenText == fresh.spokenText else {
+                return fresh
+            }
+            previous.order = fresh.order
+            previous.kind = fresh.kind
+            previous.speakerRole = fresh.speakerRole
+            previous.scriptFingerprint = fresh.scriptFingerprint
+            previous.refreshFingerprint(voiceID: voiceID, invalidateChanged: true)
+            return previous
+        }
+    }
+
+    private func reloadProjects(selecting projectID: String? = nil) {
+        do {
+            projects = try store.loadAllProjects()
+            if let projectID,
+               let refreshed = projects.first(where: { $0.id == projectID }) {
+                selectedProject = try store.loadProject(id: refreshed.id)
+            }
+        } catch {
+            status = "项目列表载入失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func reloadSelectedProject() {
+        guard let id = selectedProject?.id else { return }
+        do {
+            let reloaded = try store.loadProject(id: id)
+            selectedProject = reloaded
+            reloadProjects(selecting: id)
+        } catch {
+            status = "作品状态刷新失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func loadFinalURLs(from project: NarrationProject) {
+        var urls: [AudioExportFormat: URL] = [:]
+        guard !project.segments.isEmpty,
+              project.segments.allSatisfy({ segment in
+                  segment.generationState == .completed
+                      && segment.candidates.contains(where: {
+                          $0.id == segment.selectedCandidateID
+                              && $0.inputFingerprint == segment.inputFingerprint
+                      })
+              }) else {
+            finalAudioURLs = [:]
+            return
+        }
+        for item in project.exports {
+            guard let format = AudioExportFormat(rawValue: item.format),
+                  let url = try? store.resolveProjectFileURL(
+                    projectID: project.id,
+                    relativePath: item.relativePath
+                  ),
+                  FileManager.default.fileExists(atPath: url.path) else { continue }
+            urls[format] = url
+        }
+        finalAudioURLs = urls
+    }
+
+    private func refreshDraftAudioAvailability() {
+        guard let project = selectedProject else { return }
+        let draftMatchesSavedAudio = draftText == project.sourceText
+            && draftVoiceID == project.voiceID
+        if draftMatchesSavedAudio {
+            loadFinalURLs(from: project)
+        } else {
+            finalAudioURLs = [:]
+            if playback.contextID == project.id { playback.stopAndUnload() }
+            status = "文章或音色已经修改，点击“生成音频”即可自动更新"
+        }
+    }
+
+    private func persistPlaybackProgress(_ snapshot: PlaybackProgressSnapshot) {
+        guard var project = try? store.loadProject(id: snapshot.contextID) else { return }
+        let maximumPosition = max(0, snapshot.duration)
+        project.playbackPositionSeconds = min(
+            maximumPosition,
+            max(0, snapshot.position)
+        )
+        project.lastPlayedAt = Date()
+        project.listeningCompleted = snapshot.state == .finished
+            && !project.segments.isEmpty
+            && project.segments.allSatisfy { $0.generationState == .completed }
+        do {
+            try store.save(project)
+            if selectedProject?.id == project.id {
+                selectedProject = project
+            }
+            updateProjectInList(project)
+        } catch {
+            status = "播放位置保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func updateProjectInList(_ project: NarrationProject) {
+        if let index = projects.firstIndex(where: { $0.id == project.id }) {
+            projects[index] = project
+        } else {
+            projects.append(project)
+        }
+        projects.sort {
+            ($0.lastPlayedAt ?? $0.updatedAt) > ($1.lastPlayedAt ?? $1.updatedAt)
+        }
+    }
+
+    private func pauseSeconds(_ pause: NarrationPause) -> Double {
+        switch pause {
+        case .short: return 0.25
+        case .normal: return 0.55
+        case .long: return 0.9
+        }
+    }
+}
